@@ -26,3 +26,7 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
+
+datasets/*
+images/*
+models/*

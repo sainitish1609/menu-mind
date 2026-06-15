@@ -2,9 +2,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
-from helpers import get_lr, rotate_half, apply_rope
+from helpers import get_lr, apply_rope
 from hyperparameters import *
 from datetime import datetime
+from vision_encoder import SigLIP2VisionEncoder
+from test import images
 
 torch.manual_seed(1337)
 
@@ -118,7 +120,7 @@ class Block(nn.Module):
         x = x + self.ffwd(self.ln2(x))
         return x
 
-class GPTLanguageModel(nn.Module):
+class MenuLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -149,12 +151,20 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, image_embeds=None):
         B, T = idx.shape
 
-        x = self.token_embedding_table(idx) # (Batch, Time, Channels)
-        cos = self.rope_cos[:T]
-        sin = self.rope_sin[:T]
+        text_embeds = self.token_embedding_table(idx) # (Batch, Time, Channels)
+
+        if image_embeds is not None:
+            x = torch.cat([image_embeds, text_embeds], dim=1)
+        else:
+            x = text_embeds
+
+        T_total = x.shape[1]
+
+        cos = self.rope_cos[:T_total]
+        sin = self.rope_sin[:T_total]
         for block in self.blocks:
             x = block(x, cos, sin)
         x = self.ln_f(x)
@@ -163,10 +173,16 @@ class GPTLanguageModel(nn.Module):
         if targets is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
+            if image_embeds is not None:
+                # remove visual token logits before calculating the loss
+                logits_for_loss = logits[:, image_embeds.shape[1]: , :]
+            else:
+                logits_for_loss = logits
+
+            B, T, C = logits_for_loss.shape
+            logits_for_loss = logits_for_loss.view(B*T, C)
             targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            loss = F.cross_entropy(logits_for_loss, targets)
 
         return logits, loss
 
@@ -183,49 +199,54 @@ class GPTLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-model = GPTLanguageModel()
-m = model.to(device)
+if __name__ == "__main__":
+    model = MenuLanguageModel()
+    m = model.to(device)
+    vision_encoder = SigLIP2VisionEncoder(freeze=True).to(device)
 
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+    # print the number of parameters in the model
+    print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
-# create a PyTorch optimizer
-# split params: weight-decay the 2D tensors (matrices), leave 1D ones (norms) alone
-decay_params   = [p for p in model.parameters() if p.dim() >= 2 and p.requires_grad]
-nodecay_params = [p for p in model.parameters() if p.dim() <  2 and p.requires_grad]
+    # create a PyTorch optimizer
+    trainable_params = list(model.parameters()) + [
+        p for p in vision_encoder.parameters() if p.requires_grad
+    ]
 
-optim_groups = [
-    {'params': decay_params,   'weight_decay': 0.1},
-    {'params': nodecay_params, 'weight_decay': 0.0},
-]
+    decay_params   = [p for p in trainable_params if p.dim() >= 2 and p.requires_grad]
+    nodecay_params = [p for p in trainable_params if p.dim() <  2 and p.requires_grad]
 
-optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
+    optim_groups = [
+        {'params': decay_params,   'weight_decay': 0.1},
+        {'params': nodecay_params, 'weight_decay': 0.0},
+    ]
 
-for iter in range(max_iters):
-    lr = get_lr(iter)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
 
-    print(f"iter={iter}, time {datetime.now().strftime('%H:%M:%S')}", flush=True)
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-       losses = estimate_loss()
-       print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.2e}")
-    
-    # sample a batch of data
-    xb, yb = get_batch('train')
+    for iter in range(max_iters):
+        lr = get_lr(iter)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-    with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
-        # evaluate the loss
-        logits, loss = model(xb, yb)
+        # every once in a while evaluate the loss on train and val sets
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss()
+            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.2e}, datetime {datetime.now().strftime('%m/%d/%Y %H:%M:%S.%f')}")
+            
+        # sample a batch of data
+        xb, yb = get_batch('train')
 
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
-    optimizer.step()
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+            image_embeds = vision_encoder(images)
+            # evaluate the loss
+            logits, loss = model(xb, yb, image_embes=image_embeds)
 
-context = torch.zeros((1,1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+        optimizer.step()
 
-torch.save(model.state_dict(), 'gpt_model.pth')
-print("Model saved!")
+    context = torch.zeros((1,1), dtype=torch.long, device=device)
+    print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+    torch.save(model.state_dict(), 'menu_model.pth')
+    print("Model saved!")
