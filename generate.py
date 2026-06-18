@@ -25,7 +25,8 @@ while True:
 
     if prompt.lower() == "quit":
         break
-
+    
+    prompt = f"### Item: {prompt}\n### Details:\n"   # wrap in the trained format
     tokens = int(input("How many tokens to generate? (default=200):") or 200)
 
     result = generate(prompt=prompt, max_new_tokens=tokens)

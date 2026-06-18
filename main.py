@@ -7,34 +7,61 @@ from hyperparameters import *
 from datetime import datetime
 from vision_encoder import SigLIP2VisionEncoder
 from test import images
+import random
 
 torch.manual_seed(1337)
+random.seed(1337)
 
-# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 
 enc = tiktoken.get_encoding('gpt2')
+EOT = enc.eot_token          # 50256 — the <|endoftext|> id, your stop token
 vocab_size = enc.n_vocab
 encode = lambda s: enc.encode(s) # encoder: take a string, output a  list of integers
 decode = lambda l: enc.decode(l) # decoder: take a list of integers, output a string
 
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data))
-train_data = data[:n]
-val_data = data[n:]
+prompts = []
+for chunk in text.split('<|endoftext|>'):
+    chunk = chunk.strip()
+    if '### Details:\n' not in chunk:
+        continue
+    prompt_str, answer_str = chunk.split('### Details:\n', 1)
+    prompt_str = prompt_str + '### Details:\n'        # keep the marker in the prompt
 
-# data loading
+    prompt_ids = enc.encode(prompt_str)
+    answer_ids = enc.encode(answer_str) + [EOT]       # answer ends with the stop token
+    ids = prompt_ids + answer_ids
+
+    if len(ids) > block_size:                         # skip anything too long
+        continue
+    prompts.append((ids, len(prompt_ids)))           # (tokens, where the prompt ends)
+
+random.shuffle(prompts)
+n = int(0.9 * len(prompts))
+train_data = prompts[:n]
+val_data = prompts[n:]
+
 def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    examples = train_data if split == 'train' else val_data
+    idx = torch.randint(len(examples), (batch_size,))
+    batch = [examples[i] for i in idx]
 
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    maxlen = max(len(ids) for ids, _ in batch)        # pad to longest in this batch
+
+    x = torch.full((batch_size, maxlen - 1), EOT, dtype=torch.long)   # input (padded)
+    y = torch.full((batch_size, maxlen - 1), -100, dtype=torch.long)  # targets (default = ignore)
+
+    for row, (ids, plen) in enumerate(batch):
+        t = torch.tensor(ids, dtype=torch.long)
+        L = len(ids)
+        x[row, :L-1] = t[:-1]            # inputs  = all but last token
+        tgt = t[1:].clone()             # targets = shifted by one
+        tgt[:plen-1] = -100             # MASK the prompt region
+        y[row, :L-1] = tgt              # padding positions stay -100
+
     x, y = x.to(device), y.to(device)
-    
     return x, y
 
 @torch.no_grad()
@@ -137,7 +164,11 @@ class MenuLanguageModel(nn.Module):
 
         head_size = n_embd // n_head
         theta = 1.0 / (10000 ** (torch.arange(0, head_size, 2).float() / head_size))
-        pos = torch.arange(block_size).float()
+        
+        num_image_tokens = 256 
+        max_seq_len = block_size + num_image_tokens
+        pos = torch.arange(max_seq_len).float()
+
         freqs = torch.outer(pos, theta)              # (block_size, head_size/2)
         emb = torch.cat((freqs, freqs), dim=-1)      # (block_size, head_size)
         self.register_buffer('rope_cos', emb.cos())
@@ -186,16 +217,20 @@ class MenuLanguageModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, image_embeds=None):
         # idx is (B, T)
         for _ in range(max_new_tokens):
         
             idx_cond = idx[:, -block_size:]
 
-            logits, loss = self(idx_cond)
+            logits, loss = self(idx_cond, image_embeds=image_embeds)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+            
+            if idx_next.item() == EOT:
+                break
+            
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
@@ -236,17 +271,21 @@ if __name__ == "__main__":
         xb, yb = get_batch('train')
 
         with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
-            image_embeds = vision_encoder(images)
+            image_embeds = None
+            if len(images) > 0:
+                image_embeds = vision_encoder(images)
+            
             # evaluate the loss
-            logits, loss = model(xb, yb, image_embes=image_embeds)
+            logits, loss = model(xb, yb, image_embeds=image_embeds)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
 
-    context = torch.zeros((1,1), dtype=torch.long, device=device)
-    print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
 
+    prompt = "### Item: Chicken Biryani\n### Details:\n"
+    ctx = torch.tensor([enc.encode(prompt)], dtype=torch.long, device=device)
+    print(decode(m.generate(ctx, max_new_tokens=200)[0].tolist()))
     torch.save(model.state_dict(), 'menu_model.pth')
     print("Model saved!")
